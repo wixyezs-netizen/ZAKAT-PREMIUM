@@ -1,14 +1,17 @@
-# bot_zakat.py — ZAKAT Premium Cheat Shop
+# bot_zakat.py — ZAKAT Premium Cheat Shop с интеграцией агрегатора
 import logging
 import asyncio
 import aiohttp
 import hashlib
+import hmac
 import time
 import random
+import json
 import os
-from datetime import datetime
-from urllib.parse import quote
+from datetime import datetime, timedelta
+from urllib.parse import parse_qs, unquote, quote
 from collections import OrderedDict
+from typing import Optional, Dict, Any
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -21,20 +24,32 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# ========== ЛОГИРОВАНИЕ ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
+# ========== КОНФИГУРАЦИЯ ==========
 class Config:
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "8721428597:AAFVcJMByBrBfoWNIveqD_jSc51ijt_EiqY")
-    CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN", "493276:AAtS7R1zYy0gaPw8eax1EgiWo0tdnd6dQ9c")
-    YOOMONEY_ACCESS_TOKEN = os.environ.get("YOOMONEY_ACCESS_TOKEN", "4100118889570559.3288B2E716CEEB922A26BD6BEAC58648FBFB680CCF64E4E1447D714D6FB5EA5F01F1478FAC686BEF394C8A186C98982DE563C1ABCDF9F2F61D971B61DA3C7E486CA818F98B9E0069F1C0891E090DD56A11319D626A40F0AE8302A8339DED9EB7969617F191D93275F64C4127A3ECB7AED33FCDE91CA68690EB7534C67E6C219E")
-    YOOMONEY_WALLET = os.environ.get("YOOMONEY_WALLET", "4100118889570559")
+    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8364248036:AAEhPvRkINz08OIRhzfC37BaX8ti8bUdipc")
+    CRYPTOBOT_TOKEN: str = os.environ.get("CRYPTOBOT_TOKEN", "493276:AAtS7R1zYy0gaPw8eax1EgiWo0tdnd6dQ9c")
+    YOOMONEY_ACCESS_TOKEN: str = os.environ.get("YOOMONEY_ACCESS_TOKEN", "4100118889570559.3288B2E716CEEB922A26BD6BEAC58648FBFB680CCF64E4E1447D714D6FB5EA5F01F1478FAC686BEF394C8A186C98982DE563C1ABCDF9F2F61D971B61DA3C7E486CA818F98B9E0069F1C0891E090DD56A11319D626A40F0AE8302A8339DED9EB7969617F191D93275F64C4127A3ECB7AED33FCDE91CA68690EB7534C67E6C219E")
+    YOOMONEY_WALLET: str = os.environ.get("YOOMONEY_WALLET", "4100118889570559")
+
     SUPPORT_CHAT_USERNAME = os.environ.get("SUPPORT_CHAT_USERNAME", "ZakatManager")
     DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "https://go.linkify.ru/2GPF")
+
+    # Агрегатор
+    AGGREGATOR_BOT_TOKEN = os.environ.get("AGGREGATOR_BOT_TOKEN", "")
+    AGGREGATOR_ADMIN_ID = int(os.environ.get("AGGREGATOR_ADMIN_ID", "0")) if os.environ.get("AGGREGATOR_ADMIN_ID") else 0
+
     ADMIN_IDS = set()
     ADMIN_ID = 0
     SUPPORT_CHAT_ID = 0
+
     MAX_PENDING_ORDERS = 1000
     ORDER_EXPIRY_SECONDS = 3600
     RATE_LIMIT_SECONDS = 2
@@ -44,16 +59,28 @@ class Config:
     @classmethod
     def init(cls):
         if not cls.BOT_TOKEN:
-            raise ValueError("BOT_TOKEN is required!")
+            raise ValueError("BOT_TOKEN environment variable is required!")
+
         admin_ids_str = os.environ.get("ADMIN_ID", "")
-        admin_ids_list = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()]
+        admin_ids_list = [
+            int(x.strip())
+            for x in admin_ids_str.split(",")
+            if x.strip().isdigit()
+        ]
+
         if not admin_ids_list:
-            raise ValueError("ADMIN_ID is required!")
+            raise ValueError("ADMIN_ID environment variable is required!")
+
         cls.ADMIN_ID = admin_ids_list[0]
-        cls.SUPPORT_CHAT_ID = admin_ids_list[1] if len(admin_ids_list) >= 2 else int(os.environ.get("SUPPORT_CHAT_ID", str(cls.ADMIN_ID)))
+        cls.SUPPORT_CHAT_ID = (
+            admin_ids_list[1]
+            if len(admin_ids_list) >= 2
+            else int(os.environ.get("SUPPORT_CHAT_ID", str(cls.ADMIN_ID)))
+        )
         cls.ADMIN_IDS = set(admin_ids_list)
 
 
+# ========== ХРАНИЛИЩЕ ДАННЫХ ==========
 class OrderStorage:
     def __init__(self, max_pending=1000, expiry_seconds=3600):
         self._pending = OrderedDict()
@@ -87,13 +114,20 @@ class OrderStorage:
         async with self._lock:
             return order_id in self._confirmed
 
+    async def get_confirmed(self, order_id):
+        async with self._lock:
+            return self._confirmed.get(order_id)
+
     async def remove_pending(self, order_id):
         async with self._lock:
             return self._pending.pop(order_id, None)
 
     async def get_stats(self):
         async with self._lock:
-            return {"pending": len(self._pending), "confirmed": len(self._confirmed)}
+            return {
+                "pending": len(self._pending),
+                "confirmed": len(self._confirmed)
+            }
 
     async def get_recent_pending(self, limit=5):
         async with self._lock:
@@ -101,9 +135,14 @@ class OrderStorage:
 
     async def _cleanup_expired(self):
         now = time.time()
-        expired = [oid for oid, data in self._pending.items() if now - data.get("created_at", 0) > self._expiry_seconds]
+        expired = [
+            oid for oid, data in self._pending.items()
+            if now - data.get("created_at", 0) > self._expiry_seconds
+        ]
         for oid in expired:
             del self._pending[oid]
+        if expired:
+            logger.info("Cleaned up %d expired orders", len(expired))
 
 
 class RateLimiter:
@@ -117,92 +156,105 @@ class RateLimiter:
         if now - last < self._interval:
             return False
         self._last_action[user_id] = now
+        if len(self._last_action) > 10000:
+            cutoff = now - self._interval * 10
+            self._last_action = {
+                uid: t for uid, t in self._last_action.items()
+                if t > cutoff
+            }
         return True
 
 
-# ==================== ПРОДУКТЫ ZAKAT ====================
+# ========== ПРОДУКТЫ ==========
 PRODUCTS = {
     "apk_week": {
-        "name": "📱 ZAKAT Android",
-        "period_text": "НЕДЕЛЮ",
-        "price": 225,
-        "price_stars": 300,
-        "price_gold": 600,
-        "price_crypto_rub": 225,
+        "name": "\U0001f4f1 ZAKAT Android",
+        "period_text": "\u041d\u0415\u0414\u0415\u041b\u042e",
+        "price": 205,
+        "price_stars": 250,
+        "price_gold": 650,
+        "price_nft": 500,
+        "price_crypto_usdt": 3,
         "platform": "Android",
-        "period": "НЕДЕЛЮ",
+        "period": "\u041d\u0415\u0414\u0415\u041b\u042e",
         "platform_code": "apk",
-        "emoji": "📱",
-        "duration": "7 дней"
+        "emoji": "\U0001f4f1",
+        "duration": "7 \u0434\u043d\u0435\u0439"
     },
     "apk_month": {
-        "name": "📱 ZAKAT Android",
-        "period_text": "МЕСЯЦ",
+        "name": "\U0001f4f1 ZAKAT Android",
+        "period_text": "\u041c\u0415\u0421\u042f\u0426",
         "price": 450,
-        "price_stars": 500,
-        "price_gold": 1000,
-        "price_crypto_rub": 450,
+        "price_stars": 450,
+        "price_gold": 1200,
+        "price_nft": 1000,
+        "price_crypto_usdt": 6,
         "platform": "Android",
-        "period": "МЕСЯЦ",
+        "period": "\u041c\u0415\u0421\u042f\u0426",
         "platform_code": "apk",
-        "emoji": "📱",
-        "duration": "30 дней"
+        "emoji": "\U0001f4f1",
+        "duration": "30 \u0434\u043d\u0435\u0439"
     },
     "apk_forever": {
-        "name": "📱 ZAKAT Android",
-        "period_text": "НАВСЕГДА",
-        "price": 850,
+        "name": "\U0001f4f1 ZAKAT Android",
+        "period_text": "\u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410",
+        "price": 890,
         "price_stars": 900,
-        "price_gold": 1900,
-        "price_crypto_rub": 850,
+        "price_gold": 2200,
+        "price_nft": 1800,
+        "price_crypto_usdt": 12,
         "platform": "Android",
-        "period": "НАВСЕГДА",
+        "period": "\u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410",
         "platform_code": "apk",
-        "emoji": "📱",
-        "duration": "Навсегда"
+        "emoji": "\U0001f4f1",
+        "duration": "\u041d\u0430\u0432\u0441\u0435\u0433\u0434\u0430"
     },
     "ios_week": {
-        "name": "🍎 ZAKAT iOS",
-        "period_text": "НЕДЕЛЮ",
-        "price": 350,
+        "name": "\U0001f34e ZAKAT iOS",
+        "period_text": "\u041d\u0415\u0414\u0415\u041b\u042e",
+        "price": 359,
         "price_stars": 350,
         "price_gold": 700,
-        "price_crypto_rub": 350,
+        "price_nft": 550,
+        "price_crypto_usdt": 5,
         "platform": "iOS",
-        "period": "НЕДЕЛЮ",
+        "period": "\u041d\u0415\u0414\u0415\u041b\u042e",
         "platform_code": "ios",
-        "emoji": "🍎",
-        "duration": "7 дней"
+        "emoji": "\U0001f34e",
+        "duration": "7 \u0434\u043d\u0435\u0439"
     },
     "ios_month": {
-        "name": "🍎 ZAKAT iOS",
-        "period_text": "МЕСЯЦ",
-        "price": 700,
-        "price_stars": 700,
+        "name": "\U0001f34e ZAKAT iOS",
+        "period_text": "\u041c\u0415\u0421\u042f\u0426",
+        "price": 750,
+        "price_stars": 750,
         "price_gold": 1400,
-        "price_crypto_rub": 700,
+        "price_nft": 1200,
+        "price_crypto_usdt": 10,
         "platform": "iOS",
-        "period": "МЕСЯЦ",
+        "period": "\u041c\u0415\u0421\u042f\u0426",
         "platform_code": "ios",
-        "emoji": "🍎",
-        "duration": "30 дней"
+        "emoji": "\U0001f34e",
+        "duration": "30 \u0434\u043d\u0435\u0439"
     },
     "ios_forever": {
-        "name": "🍎 ZAKAT iOS",
-        "period_text": "НАВСЕГДА",
-        "price": 1600,
-        "price_stars": 1600,
-        "price_gold": 3000,
-        "price_crypto_rub": 1600,
+        "name": "\U0001f34e ZAKAT iOS",
+        "period_text": "\u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410",
+        "price": 1400,
+        "price_stars": 1400,
+        "price_gold": 2500,
+        "price_nft": 2200,
+        "price_crypto_usdt": 18,
         "platform": "iOS",
-        "period": "НАВСЕГДА",
+        "period": "\u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410",
         "platform_code": "ios",
-        "emoji": "🍎",
-        "duration": "Навсегда"
+        "emoji": "\U0001f34e",
+        "duration": "\u041d\u0430\u0432\u0441\u0435\u0433\u0434\u0430"
     }
 }
 
 
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def generate_order_id():
     raw = "{}_{}_{}" .format(time.time(), random.randint(100000, 999999), os.urandom(4).hex())
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
@@ -230,15 +282,22 @@ def find_product_by_id(product_id):
 
 
 def create_payment_link(amount, order_id, product_name):
-    comment = "Заказ {}: {}".format(order_id, product_name)
+    comment = "\u0417\u0430\u043a\u0430\u0437 {}: {}".format(order_id, product_name)
     safe_targets = quote(comment, safe='')
     success_url = quote('https://t.me/zakat_bot?start=success', safe='')
     return (
         "https://yoomoney.ru/quickpay/confirm.xml"
-        "?receiver={}&quickpay-form=shop&targets={}&sum={}&label={}&successURL={}&paymentType=AC"
+        "?receiver={}"
+        "&quickpay-form=shop"
+        "&targets={}"
+        "&sum={}"
+        "&label={}"
+        "&successURL={}"
+        "&paymentType=AC"
     ).format(Config.YOOMONEY_WALLET, safe_targets, amount, order_id, success_url)
 
 
+# ========== ПЛАТЁЖНЫЕ СЕРВИСЫ ==========
 class YooMoneyService:
     @staticmethod
     async def get_balance():
@@ -246,11 +305,15 @@ class YooMoneyService:
             return None
         headers = {"Authorization": "Bearer {}".format(Config.YOOMONEY_ACCESS_TOKEN)}
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get("https://yoomoney.ru/api/account-info", headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         return float(data.get('balance', 0))
+                    else:
+                        body = await resp.text()
+                        logger.error("YooMoney account-info %s: %s", resp.status, body)
         except Exception as e:
             logger.error("YooMoney balance error: %s", e)
         return None
@@ -262,21 +325,26 @@ class YooMoneyService:
         headers = {"Authorization": "Bearer {}".format(Config.YOOMONEY_ACCESS_TOKEN)}
         data = {"type": "deposition", "records": 100}
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post("https://yoomoney.ru/api/operation-history", headers=headers, data=data) as resp:
                     if resp.status != 200:
                         return False
                     result = await resp.json()
-                    for op in result.get("operations", []):
-                        if op.get("label") == order_id and op.get("status") == "success" and abs(float(op.get("amount", 0)) - expected_amount) <= 5:
+                    operations = result.get("operations", [])
+                    for op in operations:
+                        if (op.get("label") == order_id and op.get("status") == "success"
+                                and abs(float(op.get("amount", 0)) - expected_amount) <= 5):
                             return True
-                    for op in result.get("operations", []):
+                    for op in operations:
                         if op.get("status") != "success":
                             continue
-                        if abs(float(op.get("amount", 0)) - expected_amount) > 2:
+                        op_amount = float(op.get("amount", 0))
+                        if abs(op_amount - expected_amount) > 2:
                             continue
                         try:
-                            op_time = datetime.fromisoformat(op.get("datetime", "").replace("Z", "+00:00")).timestamp()
+                            dt_str = op.get("datetime", "")
+                            op_time = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).timestamp()
                             if abs(op_time - order_time) <= 1800:
                                 return True
                         except (ValueError, TypeError):
@@ -290,21 +358,19 @@ class CryptoBotService:
     BASE_URL = "https://pay.crypt.bot/api"
 
     @staticmethod
-    async def create_invoice(amount_rub, order_id, description):
+    async def create_invoice(amount_usdt, order_id, description):
         if not Config.CRYPTOBOT_TOKEN:
             return None
         headers = {"Crypto-Pay-API-Token": Config.CRYPTOBOT_TOKEN, "Content-Type": "application/json"}
         data = {
-            "currency_type": "fiat",
-            "fiat": "RUB",
-            "amount": str(amount_rub),
-            "description": description[:256],
-            "payload": order_id,
+            "asset": "USDT", "amount": str(amount_usdt),
+            "description": description[:256], "payload": order_id,
             "paid_btn_name": "callback",
             "paid_btn_url": "https://t.me/zakat_bot?start=paid_{}".format(order_id)
         }
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(CryptoBotService.BASE_URL + "/createInvoice", headers=headers, json=data) as resp:
                     if resp.status == 200:
                         result = await resp.json()
@@ -323,7 +389,8 @@ class CryptoBotService:
             return False
         headers = {"Crypto-Pay-API-Token": Config.CRYPTOBOT_TOKEN, "Content-Type": "application/json"}
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(CryptoBotService.BASE_URL + "/getInvoices", headers=headers, json={"invoice_ids": [invoice_id]}) as resp:
                     if resp.status == 200:
                         result = await resp.json()
@@ -336,7 +403,9 @@ class CryptoBotService:
         return False
 
 
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
 Config.init()
+
 bot = Bot(token=Config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -344,6 +413,7 @@ orders = OrderStorage(max_pending=Config.MAX_PENDING_ORDERS, expiry_seconds=Conf
 rate_limiter = RateLimiter(interval=Config.RATE_LIMIT_SECONDS)
 
 
+# ========== СОСТОЯНИЯ ==========
 class OrderState(StatesGroup):
     main_menu = State()
     choosing_platform = State()
@@ -351,138 +421,201 @@ class OrderState(StatesGroup):
     choosing_payment = State()
 
 
-# ==================== КЛАВИАТУРЫ ====================
+# ========== ИНТЕГРАЦИЯ С АГРЕГАТОРОМ ==========
+async def send_to_aggregator(order, product, license_key, source):
+    """Отправка данных о платеже в агрегатор"""
+    if not Config.AGGREGATOR_BOT_TOKEN or not Config.AGGREGATOR_ADMIN_ID:
+        logger.warning("Aggregator not configured")
+        return
+    
+    try:
+        # Конвертация в рубли
+        amount = order.get('amount', product['price'])
+        currency = order.get('currency', '₽')
+        
+        if currency in ('₽', 'RUB'):
+            amount_rub = float(amount)
+        elif currency == 'USDT':
+            amount_rub = float(amount) * 95
+        elif currency == '⭐':
+            amount_rub = float(amount) * 1.5
+        elif currency == 'GOLD':
+            amount_rub = float(amount) * 0.3
+        elif currency == 'NFT':
+            amount_rub = float(amount) * 0.4
+        else:
+            amount_rub = float(amount)
+        
+        payment_data = {
+            "source_bot": "zakat_premium",
+            "user_id": order["user_id"],
+            "user_name": order["user_name"],
+            "product_name": "{} ({})".format(
+                product['name'], product['duration']
+            ),
+            "amount": amount,
+            "currency": currency,
+            "amount_rub": amount_rub,
+            "payment_method": order.get('payment_method', source),
+            "license_key": license_key,
+        }
+        
+        aggregator_bot = Bot(token=Config.AGGREGATOR_BOT_TOKEN)
+        
+        cmd_text = "/record_payment {}".format(
+            json.dumps(payment_data, ensure_ascii=False)
+        )
+        
+        await aggregator_bot.send_message(
+            Config.AGGREGATOR_ADMIN_ID,
+            cmd_text
+        )
+        await aggregator_bot.session.close()
+        
+        logger.info("✅ Payment sent to aggregator")
+    except Exception as e:
+        logger.error("❌ Aggregator send error: %s", e)
+
+
+# ========== КЛАВИАТУРЫ ==========
 def start_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 Купить чит Standoff 2", callback_data="buy_cheat")],
-        [InlineKeyboardButton(text="ℹ️ О программе", callback_data="about")],
-        [InlineKeyboardButton(text="💬 Поддержка", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))]
+        [InlineKeyboardButton(text="\U0001f3ae \u041a\u0443\u043f\u0438\u0442\u044c \u0447\u0438\u0442 Standoff 2", callback_data="buy_cheat")],
+        [InlineKeyboardButton(text="\u2139\ufe0f \u041e \u043f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0435", callback_data="about")],
+        [InlineKeyboardButton(text="\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))]
     ])
 
 
 def platform_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Android", callback_data="platform_apk")],
-        [InlineKeyboardButton(text="🍎 iOS", callback_data="platform_ios")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+        [InlineKeyboardButton(text="\U0001f4f1 Android", callback_data="platform_apk")],
+        [InlineKeyboardButton(text="\U0001f34e iOS", callback_data="platform_ios")],
+        [InlineKeyboardButton(text="\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="back_to_start")]
     ])
 
 
 def subscription_keyboard(platform):
     prices = {
         "apk": [
-            ("⚡ НЕДЕЛЯ — 225₽", "sub_apk_week"),
-            ("🔥 МЕСЯЦ — 450₽", "sub_apk_month"),
-            ("💎 НАВСЕГДА — 850₽", "sub_apk_forever"),
+            ("\u26a1 \u041d\u0415\u0414\u0415\u041b\u042f \u2014 205\u20bd", "sub_apk_week"),
+            ("\U0001f525 \u041c\u0415\u0421\u042f\u0426 \u2014 450\u20bd", "sub_apk_month"),
+            ("\U0001f48e \u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410 \u2014 890\u20bd", "sub_apk_forever"),
         ],
         "ios": [
-            ("⚡ НЕДЕЛЯ — 350₽", "sub_ios_week"),
-            ("🔥 МЕСЯЦ — 700₽", "sub_ios_month"),
-            ("💎 НАВСЕГДА — 1600₽", "sub_ios_forever"),
+            ("\u26a1 \u041d\u0415\u0414\u0415\u041b\u042f \u2014 359\u20bd", "sub_ios_week"),
+            ("\U0001f525 \u041c\u0415\u0421\u042f\u0426 \u2014 750\u20bd", "sub_ios_month"),
+            ("\U0001f48e \u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410 \u2014 1400\u20bd", "sub_ios_forever"),
         ]
     }
     buttons = [[InlineKeyboardButton(text=text, callback_data=cb)] for text, cb in prices.get(platform, [])]
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="buy_cheat")])
+    buttons.append([InlineKeyboardButton(text="\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="buy_cheat")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def payment_methods_keyboard(product):
     pc = product['platform_code']
     p = product['period']
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Картой — {} ₽".format(product['price']), callback_data="pay_yoomoney_{}_{}".format(pc, p))],
-        [InlineKeyboardButton(text="⭐ Stars — {} ⭐".format(product['price_stars']), callback_data="pay_stars_{}_{}".format(pc, p))],
-        [InlineKeyboardButton(text="₿ Криптобот — {} ₽".format(product['price_crypto_rub']), callback_data="pay_crypto_{}_{}".format(pc, p))],
-        [InlineKeyboardButton(text="💰 GOLD — {} 🪙".format(product['price_gold']), callback_data="pay_gold_{}_{}".format(pc, p))],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")]
-    ])
+    buttons = [
+        [InlineKeyboardButton(text="\U0001f4b3 \u041a\u0430\u0440\u0442\u043e\u0439", callback_data="pay_yoomoney_{}_{}".format(pc, p))],
+        [InlineKeyboardButton(text="\u2b50 Telegram Stars", callback_data="pay_stars_{}_{}".format(pc, p))],
+        [InlineKeyboardButton(text="\u20bf \u041a\u0440\u0438\u043f\u0442\u043e\u0431\u043e\u0442", callback_data="pay_crypto_{}_{}".format(pc, p))],
+        [InlineKeyboardButton(text="\U0001f4b0 GOLD", callback_data="pay_gold_{}_{}".format(pc, p))],
+        [InlineKeyboardButton(text="\U0001f3a8 NFT", callback_data="pay_nft_{}_{}".format(pc, p))],
+        [InlineKeyboardButton(text="\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="back_to_subscription")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def payment_keyboard(payment_url, order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить картой", url=payment_url)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data="checkym_{}".format(order_id))],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="restart")]
+        [InlineKeyboardButton(text="\U0001f4b3 \u041e\u043f\u043b\u0430\u0442\u0438\u0442\u044c \u043a\u0430\u0440\u0442\u043e\u0439", url=payment_url)],
+        [InlineKeyboardButton(text="\u2705 \u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043e\u043f\u043b\u0430\u0442\u0443", callback_data="checkym_{}".format(order_id))],
+        [InlineKeyboardButton(text="\u274c \u041e\u0442\u043c\u0435\u043d\u0430", callback_data="restart")]
     ])
 
 
 def crypto_payment_keyboard(invoice_url, order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="₿ Оплатить криптоботом", url=invoice_url)],
-        [InlineKeyboardButton(text="✅ Проверить платеж", callback_data="checkcr_{}".format(order_id))],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="restart")]
+        [InlineKeyboardButton(text="\u20bf \u041e\u043f\u043b\u0430\u0442\u0438\u0442\u044c \u043a\u0440\u0438\u043f\u0442\u043e\u0439", url=invoice_url)],
+        [InlineKeyboardButton(text="\u2705 \u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043f\u043b\u0430\u0442\u0435\u0436", callback_data="checkcr_{}".format(order_id))],
+        [InlineKeyboardButton(text="\u274c \u041e\u0442\u043c\u0435\u043d\u0430", callback_data="restart")]
     ])
 
 
 def support_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Поддержка", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))],
-        [InlineKeyboardButton(text="🔄 Новая покупка", callback_data="restart")]
+        [InlineKeyboardButton(text="\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))],
+        [InlineKeyboardButton(text="\U0001f504 \u041d\u043e\u0432\u0430\u044f \u043f\u043e\u043a\u0443\u043f\u043a\u0430", callback_data="restart")]
     ])
 
 
 def download_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Скачать ZAKAT", url=Config.DOWNLOAD_URL)],
-        [InlineKeyboardButton(text="💬 Поддержка", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))],
-        [InlineKeyboardButton(text="🔄 Новая покупка", callback_data="restart")]
+        [InlineKeyboardButton(text="\U0001f4e5 \u0421\u043a\u0430\u0447\u0430\u0442\u044c ZAKAT", url=Config.DOWNLOAD_URL)],
+        [InlineKeyboardButton(text="\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))],
+        [InlineKeyboardButton(text="\U0001f504 \u041d\u043e\u0432\u0430\u044f \u043f\u043e\u043a\u0443\u043f\u043a\u0430", callback_data="restart")]
     ])
 
 
 def about_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_start")]
+        [InlineKeyboardButton(text="\u25c0\ufe0f \u041d\u0430\u0437\u0430\u0434", callback_data="back_to_start")]
     ])
 
 
 def admin_confirm_keyboard(order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="admin_confirm_{}".format(order_id))],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data="admin_reject_{}".format(order_id))]
+        [InlineKeyboardButton(text="\u2705 \u041f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044c", callback_data="admin_confirm_{}".format(order_id))],
+        [InlineKeyboardButton(text="\u274c \u041e\u0442\u043a\u043b\u043e\u043d\u0438\u0442\u044c", callback_data="admin_reject_{}".format(order_id))]
     ])
 
 
 def manual_payment_keyboard(support_url, sent_callback):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Перейти к оплате", url=support_url)],
-        [InlineKeyboardButton(text="✅ Я написал", callback_data=sent_callback)],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="restart")]
+        [InlineKeyboardButton(text="\U0001f4ac \u041f\u0435\u0440\u0435\u0439\u0442\u0438 \u043a \u043e\u043f\u043b\u0430\u0442\u0435", url=support_url)],
+        [InlineKeyboardButton(text="\u2705 \u042f \u043d\u0430\u043f\u0438\u0441\u0430\u043b", callback_data=sent_callback)],
+        [InlineKeyboardButton(text="\u274c \u041e\u0442\u043c\u0435\u043d\u0430", callback_data="restart")]
     ])
 
 
-# ==================== БИЗНЕС-ЛОГИКА ====================
+# ========== БИЗНЕС-ЛОГИКА ==========
 async def process_successful_payment(order_id, source="API"):
     order = await orders.get_pending(order_id)
     if not order:
         if await orders.is_confirmed(order_id):
             logger.info("Order %s already confirmed", order_id)
         return False
+
     product = order["product"]
     user_id = order["user_id"]
     license_key = generate_license_key(order_id, user_id)
-    confirmed = await orders.confirm(order_id, {'confirmed_at': time.time(), 'confirmed_by': source, 'license_key': license_key})
+
+    confirmed = await orders.confirm(order_id, {
+        'confirmed_at': time.time(), 'confirmed_by': source, 'license_key': license_key
+    })
     if not confirmed:
         return False
 
     success_text = (
-        "🎉 <b>Оплата подтверждена!</b>\n\n"
-        "✨ Добро пожаловать в ZAKAT PREMIUM!\n\n"
-        "📦 <b>Ваша покупка:</b>\n"
+        "\U0001f389 <b>\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0430!</b>\n\n"
+        "\u2728 \u0414\u043e\u0431\u0440\u043e \u043f\u043e\u0436\u0430\u043b\u043e\u0432\u0430\u0442\u044c \u0432 ZAKAT!\n\n"
+        "\U0001f4e6 <b>\u0412\u0430\u0448\u0430 \u043f\u043e\u043a\u0443\u043f\u043a\u0430:</b>\n"
         "{emoji} {name}\n"
-        "⏱️ Срок: {duration}\n"
-        "🔍 Метод: {source}\n\n"
-        "🔑 <b>Ваш лицензионный ключ:</b>\n"
+        "\u23f1\ufe0f \u0421\u0440\u043e\u043a: {duration}\n"
+        "\U0001f50d \u041c\u0435\u0442\u043e\u0434: {source}\n\n"
+        "\U0001f511 <b>\u0412\u0430\u0448 \u043b\u0438\u0446\u0435\u043d\u0437\u0438\u043e\u043d\u043d\u044b\u0439 \u043a\u043b\u044e\u0447:</b>\n"
         "<code>{key}</code>\n\n"
-        "📥 <b>Скачивание:</b>\n"
-        "👇 Нажмите кнопку ниже\n\n"
-        "💫 <b>Активация:</b>\n"
-        "1️⃣ Скачайте файл\n"
-        "2️⃣ Установите приложение\n"
-        "3️⃣ Введите ключ\n"
-        "4️⃣ Наслаждайтесь игрой! 🎮\n\n"
-        "💬 Поддержка: @{support}"
+        "\U0001f4e5 <b>\u0421\u043a\u0430\u0447\u0438\u0432\u0430\u043d\u0438\u0435:</b>\n"
+        "\U0001f447 \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u043a\u043d\u043e\u043f\u043a\u0443 \u043d\u0438\u0436\u0435\n\n"
+        "\U0001f4ab <b>\u0410\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u044f:</b>\n"
+        "1\ufe0f\u20e3 \u0421\u043a\u0430\u0447\u0430\u0439\u0442\u0435 \u0444\u0430\u0439\u043b\n"
+        "2\ufe0f\u20e3 \u0423\u0441\u0442\u0430\u043d\u043e\u0432\u0438\u0442\u0435 \u043f\u0440\u0438\u043b\u043e\u0436\u0435\u043d\u0438\u0435\n"
+        "3\ufe0f\u20e3 \u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043a\u043b\u044e\u0447\n"
+        "4\ufe0f\u20e3 \u041d\u0430\u0441\u043b\u0430\u0436\u0434\u0430\u0439\u0442\u0435\u0441\u044c \u0438\u0433\u0440\u043e\u0439! \U0001f3ae\n\n"
+        "\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430: @{support}"
     ).format(emoji=product['emoji'], name=product['name'], duration=product['duration'],
              source=source, key=license_key, support=Config.SUPPORT_CHAT_USERNAME)
+
     try:
         await bot.send_message(user_id, success_text, reply_markup=download_keyboard())
     except Exception as e:
@@ -490,29 +623,33 @@ async def process_successful_payment(order_id, source="API"):
 
     now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
     admin_text = (
-        "💎 <b>НОВАЯ ПРОДАЖА ({source})</b>\n\n"
-        "👤 {user_name}\n🆔 {user_id}\n"
-        "📦 {pname} ({dur})\n💰 {amount} {currency}\n"
-        "🔑 <code>{key}</code>\n📅 {now}"
+        "\U0001f48e <b>\u041d\u041e\u0412\u0410\u042f \u041f\u0420\u041e\u0414\u0410\u0416\u0410 ({source})</b>\n\n"
+        "\U0001f464 {user_name}\n\U0001f194 {user_id}\n"
+        "\U0001f4e6 {pname} ({dur})\n\U0001f4b0 {amount} {currency}\n"
+        "\U0001f511 <code>{key}</code>\n\U0001f4c5 {now}"
     ).format(source=source, user_name=order['user_name'], user_id=user_id,
              pname=product['name'], dur=product['duration'],
-             amount=order.get('amount', product['price']), currency=order.get('currency', '₽'),
+             amount=order.get('amount', product['price']), currency=order.get('currency', '\u20bd'),
              key=license_key, now=now_str)
     for aid in Config.ADMIN_IDS:
         try:
             await bot.send_message(aid, admin_text)
         except Exception as e:
             logger.error("Error notifying admin %s: %s", aid, e)
+    
+    # ========== ОТПРАВКА В АГРЕГАТОР ==========
+    await send_to_aggregator(order, product, license_key, source)
+    
     return True
 
 
 async def send_admin_notification(user, product, payment_method, price, order_id):
     now_str = datetime.now().strftime('%d.%m.%Y %H:%M')
     message = (
-        "🔔 <b>НОВЫЙ ЗАКАЗ</b>\n\n"
-        "👤 {fn}\n🆔 <code>{uid}</code>\n"
-        "📦 {pn} ({dur})\n💰 {price}\n💳 {pm}\n"
-        "🆔 <code>{oid}</code>\n\n📅 {now}"
+        "\U0001f514 <b>\u041d\u041e\u0412\u042b\u0419 \u0417\u0410\u041a\u0410\u0417</b>\n\n"
+        "\U0001f464 {fn}\n\U0001f194 <code>{uid}</code>\n"
+        "\U0001f4e6 {pn} ({dur})\n\U0001f4b0 {price}\n\U0001f4b3 {pm}\n"
+        "\U0001f194 <code>{oid}</code>\n\n\U0001f4c5 {now}"
     ).format(fn=user.full_name, uid=user.id, pn=product['name'], dur=product['duration'],
              price=price, pm=payment_method, oid=order_id, now=now_str)
     for aid in Config.ADMIN_IDS:
@@ -524,14 +661,14 @@ async def send_admin_notification(user, product, payment_method, price, order_id
 
 async def send_start_message(target, state):
     text = (
-        "🎯 <b>ZAKAT — Премиум чит для Standoff 2</b>\n\n"
-        "✨ <b>Возможности:</b>\n"
-        "🛡️ Продвинутая защита от банов\n"
-        "🎯 Умный AimBot с настройками\n"
-        "👁️ WallHack и ESP\n"
-        "📊 Полная информация о противниках\n"
-        "⚡ Быстрые обновления\n\n"
-        "🚀 <b>Нажмите кнопку ниже для покупки:</b>"
+        "\U0001f3af <b>ZAKAT \u2014 \u041f\u0440\u0435\u043c\u0438\u0443\u043c \u0447\u0438\u0442 \u0434\u043b\u044f Standoff 2</b>\n\n"
+        "\u2728 <b>\u0412\u043e\u0437\u043c\u043e\u0436\u043d\u043e\u0441\u0442\u0438:</b>\n"
+        "\U0001f6e1\ufe0f \u041f\u0440\u043e\u0434\u0432\u0438\u043d\u0443\u0442\u0430\u044f \u0437\u0430\u0449\u0438\u0442\u0430 \u043e\u0442 \u0431\u0430\u043d\u043e\u0432\n"
+        "\U0001f3af \u0423\u043c\u043d\u044b\u0439 AimBot \u0441 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430\u043c\u0438\n"
+        "\U0001f441\ufe0f WallHack \u0438 ESP\n"
+        "\U0001f4ca \u041f\u043e\u043b\u043d\u0430\u044f \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044f \u043e \u043f\u0440\u043e\u0442\u0438\u0432\u043d\u0438\u043a\u0430\u0445\n"
+        "\u26a1 \u0411\u044b\u0441\u0442\u0440\u044b\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f\n\n"
+        "\U0001f680 <b>\u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u043a\u043d\u043e\u043f\u043a\u0443 \u043d\u0438\u0436\u0435 \u0434\u043b\u044f \u043f\u043e\u043a\u0443\u043f\u043a\u0438:</b>"
     )
     if isinstance(target, types.Message):
         await target.answer(text, reply_markup=start_keyboard())
@@ -545,9 +682,9 @@ async def send_start_message(target, state):
 
 async def send_platform_message(target, state):
     text = (
-        "🎮 <b>Выберите платформу:</b>\n\n"
-        "📱 <b>Android</b> — APK файл\n"
-        "🍎 <b>iOS</b> — IPA файл"
+        "\U0001f3ae <b>\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043f\u043b\u0430\u0442\u0444\u043e\u0440\u043c\u0443:</b>\n\n"
+        "\U0001f4f1 <b>Android</b> \u2014 APK \u0444\u0430\u0439\u043b\n"
+        "\U0001f34e <b>iOS</b> \u2014 IPA \u0444\u0430\u0439\u043b"
     )
     if isinstance(target, types.CallbackQuery):
         try:
@@ -557,7 +694,7 @@ async def send_platform_message(target, state):
     await state.set_state(OrderState.choosing_platform)
 
 
-# ==================== ОБРАБОТЧИКИ ====================
+# ========== ОБРАБОТЧИКИ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -572,13 +709,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 await orders.add_pending(order_id, {
                     "user_id": message.from_user.id, "user_name": message.from_user.full_name,
                     "product": product, "amount": product['price_stars'],
-                    "currency": "⭐", "payment_method": "Telegram Stars",
+                    "currency": "\u2b50", "payment_method": "Telegram Stars",
                     "status": "pending", "created_at": time.time()
                 })
                 await bot.send_invoice(
                     chat_id=message.from_user.id,
-                    title="ZAKAT — {}".format(product['name']),
-                    description="Подписка на {} для {}".format(product['duration'], product['platform']),
+                    title="ZAKAT \u2014 {}".format(product['name']),
+                    description="\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043d\u0430 {} \u0434\u043b\u044f {}".format(product['duration'], product['platform']),
                     payload="stars_{}".format(order_id),
                     provider_token="", currency="XTR",
                     prices=[LabeledPrice(label="XTR", amount=product['price_stars'])],
@@ -597,16 +734,16 @@ async def buy_cheat(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "about")
 async def about_cheat(callback: types.CallbackQuery):
     text = (
-        "📋 <b>Подробная информация</b>\n\n"
-        "🎮 <b>Название:</b> ZAKAT PREMIUM\n"
-        "🔥 <b>Статус:</b> Активно обновляется\n\n"
-        "🛠️ <b>Функционал:</b>\n"
-        "• 🎯 Умный AimBot\n• 👁️ WallHack\n"
-        "• 📍 ESP\n• 🗺️ Мини-радар\n"
-        "• ⚙️ Гибкие настройки\n\n"
-        "🛡️ <b>Безопасность:</b>\n"
-        "• Обход античитов\n• Регулярные обновления\n\n"
-        "💬 Поддержка: @{support}"
+        "\U0001f4cb <b>\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u0430\u044f \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044f</b>\n\n"
+        "\U0001f3ae <b>\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435:</b> ZAKAT\n"
+        "\U0001f525 <b>\u0421\u0442\u0430\u0442\u0443\u0441:</b> \u0410\u043a\u0442\u0438\u0432\u043d\u043e \u043e\u0431\u043d\u043e\u0432\u043b\u044f\u0435\u0442\u0441\u044f\n\n"
+        "\U0001f6e0\ufe0f <b>\u0424\u0443\u043d\u043a\u0446\u0438\u043e\u043d\u0430\u043b:</b>\n"
+        "\u2022 \U0001f3af \u0423\u043c\u043d\u044b\u0439 AimBot\n\u2022 \U0001f441\ufe0f WallHack\n"
+        "\u2022 \U0001f4cd ESP\n\u2022 \U0001f5fa\ufe0f \u041c\u0438\u043d\u0438-\u0440\u0430\u0434\u0430\u0440\n"
+        "\u2022 \u2699\ufe0f \u0413\u0438\u0431\u043a\u0438\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438\n\n"
+        "\U0001f6e1\ufe0f <b>\u0411\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u043e\u0441\u0442\u044c:</b>\n"
+        "\u2022 \u041e\u0431\u0445\u043e\u0434 \u0430\u043d\u0442\u0438\u0447\u0438\u0442\u043e\u0432\n\u2022 \u0420\u0435\u0433\u0443\u043b\u044f\u0440\u043d\u044b\u0435 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f\n\n"
+        "\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430: @{support}"
     ).format(support=Config.SUPPORT_CHAT_USERNAME)
     await callback.message.edit_text(text, reply_markup=about_keyboard())
     await callback.answer()
@@ -616,19 +753,23 @@ async def about_cheat(callback: types.CallbackQuery):
 async def process_platform(callback: types.CallbackQuery, state: FSMContext):
     platform = callback.data.split("_")[1]
     if platform not in ("apk", "ios"):
-        await callback.answer("❌ Ошибка", show_alert=True)
+        await callback.answer("\u274c \u041e\u0448\u0438\u0431\u043a\u0430", show_alert=True)
         return
     await state.update_data(platform=platform)
     info = {
-        "apk": ("📱 <b>ZAKAT Android</b>",
-                "• Android 10.0+\n• 2 ГБ памяти\n• Root не нужен",
-                "• APK файл\n• Инструкция\n• Поддержка"),
-        "ios": ("🍎 <b>ZAKAT iOS</b>",
-                "• iOS 14.0 - 18.0\n• AltStore\n• Jailbreak не нужен",
-                "• IPA файл\n• Инструкция\n• Помощь")
+        "apk": ("\U0001f4f1 <b>ZAKAT Android</b>",
+                "\u2022 Android 10.0+\n\u2022 2 \u0413\u0411 \u043f\u0430\u043c\u044f\u0442\u0438\n\u2022 Root \u043d\u0435 \u043d\u0443\u0436\u0435\u043d",
+                "\u2022 APK \u0444\u0430\u0439\u043b\n\u2022 \u0418\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u044f\n\u2022 \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430"),
+        "ios": ("\U0001f34e <b>ZAKAT iOS</b>",
+                "\u2022 iOS 14.0 - 18.0\n\u2022 AltStore\n\u2022 Jailbreak \u043d\u0435 \u043d\u0443\u0436\u0435\u043d",
+                "\u2022 IPA \u0444\u0430\u0439\u043b\n\u2022 \u0418\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u044f\n\u2022 \u041f\u043e\u043c\u043e\u0449\u044c")
     }
     title, reqs, incl = info[platform]
-    text = "{title}\n\n🔧 <b>Требования:</b>\n{reqs}\n\n📦 <b>Что входит:</b>\n{incl}\n\n💰 <b>Выберите тариф:</b>".format(title=title, reqs=reqs, incl=incl)
+    text = (
+        "{title}\n\n\U0001f527 <b>\u0422\u0440\u0435\u0431\u043e\u0432\u0430\u043d\u0438\u044f:</b>\n{reqs}\n\n"
+        "\U0001f4e6 <b>\u0427\u0442\u043e \u0432\u0445\u043e\u0434\u0438\u0442:</b>\n{incl}\n\n"
+        "\U0001f4b0 <b>\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0442\u0430\u0440\u0438\u0444:</b>"
+    ).format(title=title, reqs=reqs, incl=incl)
     await callback.message.edit_text(text, reply_markup=subscription_keyboard(platform))
     await state.set_state(OrderState.choosing_subscription)
     await callback.answer()
@@ -638,25 +779,26 @@ async def process_platform(callback: types.CallbackQuery, state: FSMContext):
 async def process_subscription(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     if len(parts) < 3:
-        await callback.answer("❌ Ошибка", show_alert=True)
+        await callback.answer("\u274c \u041e\u0448\u0438\u0431\u043a\u0430", show_alert=True)
         return
     product = find_product_by_id("{}_{}".format(parts[1], parts[2]))
     if not product:
-        await callback.answer("❌ Не найден", show_alert=True)
+        await callback.answer("\u274c \u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
         return
     await state.update_data(selected_product=product)
     text = (
-        "🛒 <b>Оформление</b>\n\n"
-        "{emoji} <b>{name}</b>\n⏱️ {duration}\n\n"
-        "💎 <b>Стоимость:</b>\n"
-        "💳 Картой: {price} ₽\n"
-        "⭐ Stars: {stars} ⭐\n"
-        "₿ Криптобот: {crypto} ₽\n"
-        "💰 GOLD: {gold} 🪙\n\n"
-        "🎯 <b>Способ оплаты:</b>"
+        "\U0001f6d2 <b>\u041e\u0444\u043e\u0440\u043c\u043b\u0435\u043d\u0438\u0435</b>\n\n"
+        "{emoji} <b>{name}</b>\n\u23f1\ufe0f {duration}\n\n"
+        "\U0001f48e <b>\u0421\u0442\u043e\u0438\u043c\u043e\u0441\u0442\u044c:</b>\n"
+        "\U0001f4b3 \u041a\u0430\u0440\u0442\u043e\u0439: {price} \u20bd\n"
+        "\u2b50 Stars: {stars} \u2b50\n"
+        "\u20bf \u041a\u0440\u0438\u043f\u0442\u0430: {crypto} USDT\n"
+        "\U0001f4b0 GOLD: {gold} \U0001fa99\n"
+        "\U0001f3a8 NFT: {nft} \U0001f5bc\ufe0f\n\n"
+        "\U0001f3af <b>\u0421\u043f\u043e\u0441\u043e\u0431 \u043e\u043f\u043b\u0430\u0442\u044b:</b>"
     ).format(emoji=product['emoji'], name=product['name'], duration=product['duration'],
-             price=product['price'], stars=product['price_stars'], crypto=product['price_crypto_rub'],
-             gold=product['price_gold'])
+             price=product['price'], stars=product['price_stars'], crypto=product['price_crypto_usdt'],
+             gold=product['price_gold'], nft=product['price_nft'])
     await callback.message.edit_text(text, reply_markup=payment_methods_keyboard(product))
     await state.set_state(OrderState.choosing_payment)
     await callback.answer()
@@ -666,7 +808,7 @@ async def process_subscription(callback: types.CallbackQuery, state: FSMContext)
 @dp.callback_query(F.data.startswith("pay_yoomoney_"))
 async def process_yoomoney_payment(callback: types.CallbackQuery):
     if not Config.YOOMONEY_WALLET:
-        await callback.answer("❌ Недоступно", show_alert=True)
+        await callback.answer("\u274c \u041d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e", show_alert=True)
         return
     parts = callback.data.split("_")
     if len(parts) < 4:
@@ -675,25 +817,25 @@ async def process_yoomoney_payment(callback: types.CallbackQuery):
     if not product:
         return
     if not rate_limiter.check(callback.from_user.id):
-        await callback.answer("⏳ Подождите...", show_alert=True)
+        await callback.answer("\u23f3 \u041f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435...", show_alert=True)
         return
     order_id = generate_order_id()
     amount = product["price"]
     payment_url = create_payment_link(amount, order_id, "{} ({})".format(product['name'], product['duration']))
     await orders.add_pending(order_id, {
         "user_id": callback.from_user.id, "user_name": callback.from_user.full_name,
-        "product": product, "amount": amount, "currency": "₽",
-        "payment_method": "Картой", "status": "pending", "created_at": time.time()
+        "product": product, "amount": amount, "currency": "\u20bd",
+        "payment_method": "\u041a\u0430\u0440\u0442\u043e\u0439", "status": "pending", "created_at": time.time()
     })
     text = (
-        "💳 <b>Оплата картой</b>\n\n"
-        "{emoji} {name}\n⏱️ {dur}\n"
-        "💰 <b>{amount} ₽</b>\n🆔 <code>{oid}</code>\n\n"
-        "1️⃣ Нажмите «Оплатить»\n"
-        "2️⃣ Оплатите\n3️⃣ Нажмите «Проверить»"
+        "\U0001f4b3 <b>\u041e\u043f\u043b\u0430\u0442\u0430 \u043a\u0430\u0440\u0442\u043e\u0439</b>\n\n"
+        "{emoji} {name}\n\u23f1\ufe0f {dur}\n"
+        "\U0001f4b0 <b>{amount} \u20bd</b>\n\U0001f194 <code>{oid}</code>\n\n"
+        "1\ufe0f\u20e3 \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041e\u043f\u043b\u0430\u0442\u0438\u0442\u044c\u00bb\n"
+        "2\ufe0f\u20e3 \u041e\u043f\u043b\u0430\u0442\u0438\u0442\u0435\n3\ufe0f\u20e3 \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c\u00bb"
     ).format(emoji=product['emoji'], name=product['name'], dur=product['duration'], amount=amount, oid=order_id)
     await callback.message.edit_text(text, reply_markup=payment_keyboard(payment_url, order_id))
-    await send_admin_notification(callback.from_user, product, "💳 Картой", "{} ₽".format(amount), order_id)
+    await send_admin_notification(callback.from_user, product, "\U0001f4b3 \u041a\u0430\u0440\u0442\u043e\u0439", "{} \u20bd".format(amount), order_id)
     await callback.answer()
 
 
@@ -704,15 +846,17 @@ async def check_yoomoney_callback(callback: types.CallbackQuery):
     order = await orders.get_pending(order_id)
     if not order:
         if await orders.is_confirmed(order_id):
-            await callback.answer("✅ Уже подтверждён!", show_alert=True)
+            await callback.answer("\u2705 \u0423\u0436\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d!", show_alert=True)
         else:
-            await callback.answer("❌ Не найден", show_alert=True)
+            await callback.answer("\u274c \u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
         return
     if not rate_limiter.check(callback.from_user.id):
-        await callback.answer("⏳ Подождите...", show_alert=True)
+        await callback.answer("\u23f3 \u041f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435...", show_alert=True)
         return
-    await callback.answer("🔍 Проверяем...")
-    checking_msg = await callback.message.edit_text("🔄 <b>Проверка платежа...</b>\n⏳ Подождите 15-25 секунд...")
+    await callback.answer("\U0001f50d \u041f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u043c...")
+    checking_msg = await callback.message.edit_text(
+        "\U0001f504 <b>\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u043f\u043b\u0430\u0442\u0435\u0436\u0430...</b>\n\u23f3 \u041f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435 15-25 \u0441\u0435\u043a\u0443\u043d\u0434..."
+    )
     payment_found = False
     for attempt in range(Config.MAX_PAYMENT_CHECK_ATTEMPTS):
         payment_found = await YooMoneyService.check_payment(order_id, order["amount"], order.get("created_at", time.time()))
@@ -720,16 +864,16 @@ async def check_yoomoney_callback(callback: types.CallbackQuery):
             break
         await asyncio.sleep(Config.PAYMENT_CHECK_INTERVAL)
     if payment_found:
-        success = await process_successful_payment(order_id, "Автопроверка")
+        success = await process_successful_payment(order_id, "\u0410\u0432\u0442\u043e\u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0430")
         if success:
-            await checking_msg.edit_text("✅ <b>Платеж найден!</b>\n📨 Проверьте сообщение ⬆️", reply_markup=support_keyboard())
+            await checking_msg.edit_text("\u2705 <b>\u041f\u043b\u0430\u0442\u0435\u0436 \u043d\u0430\u0439\u0434\u0435\u043d!</b>\n\U0001f4e8 \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u2b06\ufe0f", reply_markup=support_keyboard())
         else:
-            await checking_msg.edit_text("✅ Уже обработан", reply_markup=support_keyboard())
+            await checking_msg.edit_text("\u2705 \u0423\u0436\u0435 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d", reply_markup=support_keyboard())
     else:
         product = order['product']
         payment_url = create_payment_link(order["amount"], order_id, "{} ({})".format(product['name'], product['duration']))
         await checking_msg.edit_text(
-            "⏳ <b>Платеж не найден</b>\n\n💰 {amount} ₽\n🆔 <code>{oid}</code>\n\n⏰ Попробуйте через 1-2 мин".format(amount=order['amount'], oid=order_id),
+            "\u23f3 <b>\u041f\u043b\u0430\u0442\u0435\u0436 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d</b>\n\n\U0001f4b0 {amount} \u20bd\n\U0001f194 <code>{oid}</code>\n\n\u23f0 \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0447\u0435\u0440\u0435\u0437 1-2 \u043c\u0438\u043d".format(amount=order['amount'], oid=order_id),
             reply_markup=payment_keyboard(payment_url, order_id)
         )
 
@@ -744,24 +888,24 @@ async def process_stars_payment(callback: types.CallbackQuery):
     if not product:
         return
     if not rate_limiter.check(callback.from_user.id):
-        await callback.answer("⏳ Подождите...", show_alert=True)
+        await callback.answer("\u23f3 \u041f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435...", show_alert=True)
         return
     order_id = generate_order_id()
     await orders.add_pending(order_id, {
         "user_id": callback.from_user.id, "user_name": callback.from_user.full_name,
-        "product": product, "amount": product['price_stars'], "currency": "⭐",
+        "product": product, "amount": product['price_stars'], "currency": "\u2b50",
         "payment_method": "Telegram Stars", "status": "pending", "created_at": time.time()
     })
     await bot.send_invoice(
         chat_id=callback.from_user.id,
-        title="ZAKAT — {}".format(product['name']),
-        description="Подписка на {} для {}".format(product['duration'], product['platform']),
+        title="ZAKAT \u2014 {}".format(product['name']),
+        description="\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043d\u0430 {} \u0434\u043b\u044f {}".format(product['duration'], product['platform']),
         payload="stars_{}".format(order_id),
         provider_token="", currency="XTR",
         prices=[LabeledPrice(label="XTR", amount=product['price_stars'])],
         start_parameter="zakat_payment"
     )
-    await send_admin_notification(callback.from_user, product, "⭐ Stars", "{} ⭐".format(product['price_stars']), order_id)
+    await send_admin_notification(callback.from_user, product, "\u2b50 Stars", "{} \u2b50".format(product['price_stars']), order_id)
     try:
         await callback.message.delete()
     except Exception:
@@ -785,7 +929,7 @@ async def successful_payment(message: types.Message):
 @dp.callback_query(F.data.startswith("pay_crypto_"))
 async def process_crypto_payment(callback: types.CallbackQuery):
     if not Config.CRYPTOBOT_TOKEN:
-        await callback.answer("❌ Недоступно", show_alert=True)
+        await callback.answer("\u274c \u041d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u043e", show_alert=True)
         return
     parts = callback.data.split("_")
     if len(parts) < 4:
@@ -794,28 +938,28 @@ async def process_crypto_payment(callback: types.CallbackQuery):
     if not product:
         return
     if not rate_limiter.check(callback.from_user.id):
-        await callback.answer("⏳ Подождите...", show_alert=True)
+        await callback.answer("\u23f3 \u041f\u043e\u0434\u043e\u0436\u0434\u0438\u0442\u0435...", show_alert=True)
         return
     order_id = generate_order_id()
-    amount_rub = product["price_crypto_rub"]
-    invoice_data = await CryptoBotService.create_invoice(amount_rub, order_id, "ZAKAT {} ({})".format(product['name'], product['duration']))
+    amount_usdt = product["price_crypto_usdt"]
+    invoice_data = await CryptoBotService.create_invoice(amount_usdt, order_id, "ZAKAT {} ({})".format(product['name'], product['duration']))
     if not invoice_data:
-        await callback.answer("❌ Ошибка инвойса", show_alert=True)
+        await callback.answer("\u274c \u041e\u0448\u0438\u0431\u043a\u0430 \u0438\u043d\u0432\u043e\u0439\u0441\u0430", show_alert=True)
         return
     await orders.add_pending(order_id, {
         "user_id": callback.from_user.id, "user_name": callback.from_user.full_name,
-        "product": product, "amount": amount_rub, "currency": "₽ (крипто)",
+        "product": product, "amount": amount_usdt, "currency": "USDT",
         "payment_method": "CryptoBot", "status": "pending",
         "invoice_id": invoice_data["invoice_id"], "created_at": time.time()
     })
     text = (
-        "₿ <b>Криптооплата</b>\n\n"
-        "{emoji} {name}\n⏱️ {dur}\n💰 <b>{amount} ₽</b>\n🆔 <code>{oid}</code>\n\n"
-        "1️⃣ Нажмите «Оплатить»\n"
-        "2️⃣ Выберите валюту\n3️⃣ Нажмите «Проверить»"
-    ).format(emoji=product['emoji'], name=product['name'], dur=product['duration'], amount=amount_rub, oid=order_id)
+        "\u20bf <b>\u041a\u0440\u0438\u043f\u0442\u043e\u043e\u043f\u043b\u0430\u0442\u0430</b>\n\n"
+        "{emoji} {name}\n\u23f1\ufe0f {dur}\n\U0001f4b0 <b>{amount} USDT</b>\n\U0001f194 <code>{oid}</code>\n\n"
+        "1\ufe0f\u20e3 \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041e\u043f\u043b\u0430\u0442\u0438\u0442\u044c\u00bb\n"
+        "2\ufe0f\u20e3 \u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0432\u0430\u043b\u044e\u0442\u0443\n3\ufe0f\u20e3 \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c\u00bb"
+    ).format(emoji=product['emoji'], name=product['name'], dur=product['duration'], amount=amount_usdt, oid=order_id)
     await callback.message.edit_text(text, reply_markup=crypto_payment_keyboard(invoice_data["pay_url"], order_id))
-    await send_admin_notification(callback.from_user, product, "₿ CryptoBot", "{} ₽".format(amount_rub), order_id)
+    await send_admin_notification(callback.from_user, product, "\u20bf CryptoBot", "{} USDT".format(amount_usdt), order_id)
     await callback.answer()
 
 
@@ -825,28 +969,37 @@ async def check_crypto_callback(callback: types.CallbackQuery):
     order = await orders.get_pending(order_id)
     if not order:
         if await orders.is_confirmed(order_id):
-            await callback.answer("✅ Уже оплачено!", show_alert=True)
+            await callback.answer("\u2705 \u0423\u0436\u0435 \u043e\u043f\u043b\u0430\u0447\u0435\u043d\u043e!", show_alert=True)
         else:
-            await callback.answer("❌ Не найден", show_alert=True)
+            await callback.answer("\u274c \u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
         return
     if not rate_limiter.check(callback.from_user.id):
-        await callback.answer("⏳", show_alert=True)
+        await callback.answer("\u23f3", show_alert=True)
         return
-    await callback.answer("🔍 Проверяем...")
+    await callback.answer("\U0001f50d \u041f\u0440\u043e\u0432\u0435\u0440\u044f\u0435\u043c...")
     invoice_id = order.get("invoice_id")
     if not invoice_id:
         return
     if await CryptoBotService.check_invoice(invoice_id):
         success = await process_successful_payment(order_id, "CryptoBot")
         if success:
-            await callback.message.edit_text("✅ <b>Криптоплатеж подтвержден!</b>\n📨 Ключ отправлен ⬆️", reply_markup=support_keyboard())
+            await callback.message.edit_text("\u2705 <b>\u041a\u0440\u0438\u043f\u0442\u043e\u043f\u043b\u0430\u0442\u0435\u0436 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d!</b>\n\U0001f4e8 \u041a\u043b\u044e\u0447 \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d \u2b06\ufe0f", reply_markup=support_keyboard())
     else:
-        await callback.answer("⏳ Не подтвержден. Попробуйте через минуту.", show_alert=True)
+        await callback.answer("\u23f3 \u041d\u0435 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0447\u0435\u0440\u0435\u0437 \u043c\u0438\u043d\u0443\u0442\u0443.", show_alert=True)
 
 
-# ========== ОПЛАТА GOLD ==========
+# ========== ОПЛАТА GOLD / NFT ==========
 @dp.callback_query(F.data.startswith("pay_gold_"))
 async def process_gold_payment(callback: types.CallbackQuery):
+    await _process_manual_payment(callback, "gold")
+
+
+@dp.callback_query(F.data.startswith("pay_nft_"))
+async def process_nft_payment(callback: types.CallbackQuery):
+    await _process_manual_payment(callback, "nft")
+
+
+async def _process_manual_payment(callback, method):
     parts = callback.data.split("_")
     if len(parts) < 4:
         return
@@ -854,41 +1007,48 @@ async def process_gold_payment(callback: types.CallbackQuery):
     if not product:
         return
     if not rate_limiter.check(callback.from_user.id):
-        await callback.answer("⏳", show_alert=True)
+        await callback.answer("\u23f3", show_alert=True)
         return
-    price = product["price_gold"]
+    cfg = {
+        "gold": {"name": "GOLD", "icon": "\U0001f4b0", "price_key": "price_gold", "emoji": "\U0001fa99"},
+        "nft": {"name": "NFT", "icon": "\U0001f3a8", "price_key": "price_nft", "emoji": "\U0001f5bc\ufe0f"}
+    }[method]
+    price = product[cfg["price_key"]]
     chat_message = (
-        "Привет! Хочу купить чит ZAKAT на Standoff 2. "
-        "Подписка на {period} ({platform}). "
-        "Готов купить за {price} GOLD"
-    ).format(period=product['period_text'], platform=product['platform'], price=price)
+        "\u041f\u0440\u0438\u0432\u0435\u0442! \u0425\u043e\u0447\u0443 \u043a\u0443\u043f\u0438\u0442\u044c \u0447\u0438\u0442 ZAKAT \u043d\u0430 Standoff 2. "
+        "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043d\u0430 {period} ({platform}). "
+        "\u0413\u043e\u0442\u043e\u0432 \u043a\u0443\u043f\u0438\u0442\u044c \u0437\u0430 {price} {method}"
+    ).format(period=product['period_text'], platform=product['platform'], price=price, method=cfg['name'])
     support_url = "https://t.me/{}?text={}".format(Config.SUPPORT_CHAT_USERNAME, quote(chat_message, safe=''))
     order_id = generate_order_id()
     await orders.add_pending(order_id, {
         "user_id": callback.from_user.id, "user_name": callback.from_user.full_name,
-        "product": product, "amount": price, "currency": "GOLD",
-        "payment_method": "GOLD", "status": "pending", "created_at": time.time()
+        "product": product, "amount": price, "currency": cfg["name"],
+        "payment_method": cfg["name"], "status": "pending", "created_at": time.time()
     })
     text = (
-        "💰 <b>Оплата GOLD</b>\n\n"
-        "{emoji} {pname}\n⏱️ {dur}\n💰 <b>{price} GOLD</b>\n\n"
-        "📝 <b>Сообщение:</b>\n<code>{msg}</code>\n\n"
-        "1️⃣ Напишите в поддержку\n"
-        "2️⃣ Ожидайте обработки"
-    ).format(emoji=product['emoji'], pname=product['name'], dur=product['duration'], price=price, msg=chat_message)
-    await callback.message.edit_text(text, reply_markup=manual_payment_keyboard(support_url, "gold_sent"))
-    await send_admin_notification(callback.from_user, product, "💰 GOLD", "{} 🪙".format(price), order_id)
+        "{icon} <b>\u041e\u043f\u043b\u0430\u0442\u0430 {mname}</b>\n\n"
+        "{emoji} {pname}\n\u23f1\ufe0f {dur}\n\U0001f4b0 <b>{price} {mname}</b>\n\n"
+        "\U0001f4dd <b>\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435:</b>\n<code>{msg}</code>\n\n"
+        "1\ufe0f\u20e3 \u041d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0432 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0443\n"
+        "2\ufe0f\u20e3 \u041e\u0436\u0438\u0434\u0430\u0439\u0442\u0435 \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0438"
+    ).format(icon=cfg['icon'], mname=cfg['name'], emoji=product['emoji'], pname=product['name'],
+             dur=product['duration'], price=price, msg=chat_message)
+    await callback.message.edit_text(text, reply_markup=manual_payment_keyboard(support_url, "{}_sent".format(method)))
+    await send_admin_notification(callback.from_user, product, "{} {}".format(cfg['icon'], cfg['name']), "{} {}".format(price, cfg['emoji']), order_id)
     await callback.answer()
 
 
-@dp.callback_query(F.data == "gold_sent")
-async def gold_payment_sent(callback: types.CallbackQuery):
+@dp.callback_query(F.data.in_({"gold_sent", "nft_sent"}))
+async def manual_payment_sent(callback: types.CallbackQuery):
+    mname = "GOLD" if callback.data == "gold_sent" else "NFT"
+    icon = "\U0001f4b0" if callback.data == "gold_sent" else "\U0001f3a8"
     text = (
-        "✅ <b>Отлично!</b>\n\n"
-        "💰 Ваш GOLD заказ принят\n"
-        "⏱️ Обработка: до 30 мин\n\n"
-        "💬 Поддержка: @{support}"
-    ).format(support=Config.SUPPORT_CHAT_USERNAME)
+        "\u2705 <b>\u041e\u0442\u043b\u0438\u0447\u043d\u043e!</b>\n\n"
+        "{icon} \u0412\u0430\u0448 {mname} \u0437\u0430\u043a\u0430\u0437 \u043f\u0440\u0438\u043d\u044f\u0442\n"
+        "\u23f1\ufe0f \u041e\u0431\u0440\u0430\u0431\u043e\u0442\u043a\u0430: \u0434\u043e 30 \u043c\u0438\u043d\n\n"
+        "\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430: @{support}"
+    ).format(icon=icon, mname=mname, support=Config.SUPPORT_CHAT_USERNAME)
     await callback.message.edit_text(text, reply_markup=support_keyboard())
     await callback.answer()
 
@@ -897,31 +1057,33 @@ async def gold_payment_sent(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("admin_confirm_"))
 async def admin_confirm(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("❌", show_alert=True)
+        await callback.answer("\u274c", show_alert=True)
         return
     order_id = callback.data.replace("admin_confirm_", "", 1)
-    success = await process_successful_payment(order_id, "👨‍💼 Админ")
+    success = await process_successful_payment(order_id, "\U0001f468\u200d\U0001f4bc \u0410\u0434\u043c\u0438\u043d")
     if success:
-        await callback.message.edit_text("✅ <b>Подтверждён</b>\n🆔 {}\n👨‍💼 {}".format(order_id, callback.from_user.full_name))
-        await callback.answer("✅")
+        await callback.message.edit_text(
+            "\u2705 <b>\u041f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d</b>\n\U0001f194 {}\n\U0001f468\u200d\U0001f4bc {}".format(order_id, callback.from_user.full_name))
+        await callback.answer("\u2705")
     else:
-        await callback.answer("❌ Не найден", show_alert=True)
+        await callback.answer("\u274c \u041d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("admin_reject_"))
 async def admin_reject(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("❌", show_alert=True)
+        await callback.answer("\u274c", show_alert=True)
         return
     order_id = callback.data.replace("admin_reject_", "", 1)
     order = await orders.remove_pending(order_id)
     if order:
-        await callback.message.edit_text("❌ <b>Отклонён</b>\n🆔 {}".format(order_id))
+        await callback.message.edit_text("\u274c <b>\u041e\u0442\u043a\u043b\u043e\u043d\u0435\u043d</b>\n\U0001f194 {}".format(order_id))
         try:
-            await bot.send_message(order['user_id'], "❌ <b>Заказ отклонён</b>\n💬 @{}".format(Config.SUPPORT_CHAT_USERNAME))
+            await bot.send_message(order['user_id'],
+                "\u274c <b>\u0417\u0430\u043a\u0430\u0437 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d</b>\n\U0001f4ac @{}".format(Config.SUPPORT_CHAT_USERNAME))
         except Exception:
             pass
-    await callback.answer("❌")
+    await callback.answer("\u274c")
 
 
 @dp.message(Command("orders"))
@@ -929,14 +1091,14 @@ async def cmd_orders(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     stats = await orders.get_stats()
-    text = "📊 <b>СТАТИСТИКА</b>\n\n⏳ Ожидают: {}\n".format(stats['pending'])
+    text = "\U0001f4ca <b>\u0421\u0422\u0410\u0422\u0418\u0421\u0422\u0418\u041a\u0410</b>\n\n\u23f3 \u041e\u0436\u0438\u0434\u0430\u044e\u0442: {}\n".format(stats['pending'])
     for oid, order in await orders.get_recent_pending(5):
         t = datetime.fromtimestamp(order['created_at']).strftime('%H:%M')
-        text += "• {} | {} | {}\n".format(t, order['user_name'], order['product']['name'])
-    text += "\n✅ Подтверждено: {}\n".format(stats['confirmed'])
+        text += "\u2022 {} | {} | {}\n".format(t, order['user_name'], order['product']['name'])
+    text += "\n\u2705 \u041f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u043e: {}\n".format(stats['confirmed'])
     balance = await YooMoneyService.get_balance()
     if balance is not None:
-        text += "💰 Баланс: {} ₽".format(balance)
+        text += "\U0001f4b0 \u0411\u0430\u043b\u0430\u043d\u0441: {} \u20bd".format(balance)
     await message.answer(text)
 
 
@@ -944,7 +1106,7 @@ async def cmd_orders(message: types.Message):
 async def cmd_help(message: types.Message):
     if not is_admin(message.from_user.id):
         return
-    await message.answer("/orders — Статистика\n/help — Справка")
+    await message.answer("/orders \u2014 \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430\n/help \u2014 \u0421\u043f\u0440\u0430\u0432\u043a\u0430")
 
 
 # ========== НАВИГАЦИЯ ==========
@@ -966,26 +1128,44 @@ async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
 async def back_to_subscription(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     platform = data.get("platform", "apk")
-    titles = {"apk": "📱 <b>ZAKAT Android</b>", "ios": "🍎 <b>ZAKAT iOS</b>"}
-    text = "{}\n\n💰 <b>Выберите тариф:</b>".format(titles.get(platform, "ZAKAT"))
+    titles = {"apk": "\U0001f4f1 <b>ZAKAT Android</b>", "ios": "\U0001f34e <b>ZAKAT iOS</b>"}
+    text = "{}\n\n\U0001f4b0 <b>\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0442\u0430\u0440\u0438\u0444:</b>".format(titles.get(platform, "ZAKAT"))
     await callback.message.edit_text(text, reply_markup=subscription_keyboard(platform))
     await state.set_state(OrderState.choosing_subscription)
     await callback.answer()
 
 
+# ========== ЗАПУСК ==========
 async def main():
     logger.info("=" * 50)
     logger.info("ZAKAT PREMIUM CHEAT SHOP BOT")
     logger.info("=" * 50)
+    logger.info("ADMIN_IDS: %s", Config.ADMIN_IDS)
+    logger.info("SUPPORT: @%s", Config.SUPPORT_CHAT_USERNAME)
+    logger.info("DOWNLOAD: %s", Config.DOWNLOAD_URL)
+    if Config.AGGREGATOR_BOT_TOKEN and Config.AGGREGATOR_ADMIN_ID:
+        logger.info("✅ Aggregator: ENABLED")
+    else:
+        logger.warning("⚠️ Aggregator: DISABLED (not configured)")
+
     try:
         me = await bot.get_me()
         logger.info("Bot: @%s", me.username)
+        for key, product in PRODUCTS.items():
+            logger.info("%s %s (%s) - %s RUB / %s Stars / %s Gold",
+                        product['emoji'], product['name'], product['duration'],
+                        product['price'], product['price_stars'], product['price_gold'])
         logger.info("Bot starting polling...")
         await dp.start_polling(bot)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
     except Exception as e:
         logger.error("Fatal error: %s", e)
+        import traceback
+        traceback.print_exc()
     finally:
         await bot.session.close()
+        logger.info("Bot stopped")
 
 
 if __name__ == "__main__":
