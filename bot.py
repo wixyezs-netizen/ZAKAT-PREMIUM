@@ -1,4 +1,4 @@
-# bot_zakat.py — ZAKAT Premium Cheat Shop с интеграцией агрегатора
+# bot.py — PMT Premium Cheat Shop
 import logging
 import asyncio
 import aiohttp
@@ -34,17 +34,13 @@ logger = logging.getLogger(__name__)
 
 # ========== КОНФИГУРАЦИЯ ==========
 class Config:
-    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8364248036:AAEhPvRkINz08OIRhzfC37BaX8ti8bUdipc")
+    BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "8434646887:AAFs0Me2Vl3mNy81rV-nDTCQZxfO6N-dpBU")
     CRYPTOBOT_TOKEN: str = os.environ.get("CRYPTOBOT_TOKEN", "493276:AAtS7R1zYy0gaPw8eax1EgiWo0tdnd6dQ9c")
     YOOMONEY_ACCESS_TOKEN: str = os.environ.get("YOOMONEY_ACCESS_TOKEN", "4100118889570559.3288B2E716CEEB922A26BD6BEAC58648FBFB680CCF64E4E1447D714D6FB5EA5F01F1478FAC686BEF394C8A186C98982DE563C1ABCDF9F2F61D971B61DA3C7E486CA818F98B9E0069F1C0891E090DD56A11319D626A40F0AE8302A8339DED9EB7969617F191D93275F64C4127A3ECB7AED33FCDE91CA68690EB7534C67E6C219E")
     YOOMONEY_WALLET: str = os.environ.get("YOOMONEY_WALLET", "4100118889570559")
 
-    SUPPORT_CHAT_USERNAME = os.environ.get("SUPPORT_CHAT_USERNAME", "ZakatManager")
+    SUPPORT_CHAT_USERNAME = os.environ.get("SUPPORT_CHAT_USERNAME", "PMThelp")
     DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "https://go.linkify.ru/2GPF")
-
-    # Агрегатор
-    AGGREGATOR_BOT_TOKEN = os.environ.get("AGGREGATOR_BOT_TOKEN", "")
-    AGGREGATOR_ADMIN_ID = int(os.environ.get("AGGREGATOR_ADMIN_ID", "0")) if os.environ.get("AGGREGATOR_ADMIN_ID") else 0
 
     ADMIN_IDS = set()
     ADMIN_ID = 0
@@ -78,6 +74,13 @@ class Config:
             else int(os.environ.get("SUPPORT_CHAT_ID", str(cls.ADMIN_ID)))
         )
         cls.ADMIN_IDS = set(admin_ids_list)
+
+        if not cls.CRYPTOBOT_TOKEN:
+            logger.warning("CRYPTOBOT_TOKEN not set - crypto payments disabled")
+        if not cls.YOOMONEY_ACCESS_TOKEN:
+            logger.warning("YOOMONEY_ACCESS_TOKEN not set - card payments disabled")
+        if not cls.YOOMONEY_WALLET:
+            logger.warning("YOOMONEY_WALLET not set - card payments disabled")
 
 
 # ========== ХРАНИЛИЩЕ ДАННЫХ ==========
@@ -168,7 +171,7 @@ class RateLimiter:
 # ========== ПРОДУКТЫ ==========
 PRODUCTS = {
     "apk_week": {
-        "name": "\U0001f4f1 ZAKAT Android",
+        "name": "\U0001f4f1 PMT Android",
         "period_text": "\u041d\u0415\u0414\u0415\u041b\u042e",
         "price": 205,
         "price_stars": 250,
@@ -182,7 +185,7 @@ PRODUCTS = {
         "duration": "7 \u0434\u043d\u0435\u0439"
     },
     "apk_month": {
-        "name": "\U0001f4f1 ZAKAT Android",
+        "name": "\U0001f4f1 PMT Android",
         "period_text": "\u041c\u0415\u0421\u042f\u0426",
         "price": 450,
         "price_stars": 450,
@@ -196,7 +199,7 @@ PRODUCTS = {
         "duration": "30 \u0434\u043d\u0435\u0439"
     },
     "apk_forever": {
-        "name": "\U0001f4f1 ZAKAT Android",
+        "name": "\U0001f4f1 PMT Android",
         "period_text": "\u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410",
         "price": 890,
         "price_stars": 900,
@@ -210,7 +213,7 @@ PRODUCTS = {
         "duration": "\u041d\u0430\u0432\u0441\u0435\u0433\u0434\u0430"
     },
     "ios_week": {
-        "name": "\U0001f34e ZAKAT iOS",
+        "name": "\U0001f34e PMT iOS",
         "period_text": "\u041d\u0415\u0414\u0415\u041b\u042e",
         "price": 359,
         "price_stars": 350,
@@ -224,7 +227,7 @@ PRODUCTS = {
         "duration": "7 \u0434\u043d\u0435\u0439"
     },
     "ios_month": {
-        "name": "\U0001f34e ZAKAT iOS",
+        "name": "\U0001f34e PMT iOS",
         "period_text": "\u041c\u0415\u0421\u042f\u0426",
         "price": 750,
         "price_stars": 750,
@@ -238,7 +241,7 @@ PRODUCTS = {
         "duration": "30 \u0434\u043d\u0435\u0439"
     },
     "ios_forever": {
-        "name": "\U0001f34e ZAKAT iOS",
+        "name": "\U0001f34e PMT iOS",
         "period_text": "\u041d\u0410\u0412\u0421\u0415\u0413\u0414\u0410",
         "price": 1400,
         "price_stars": 1400,
@@ -263,7 +266,7 @@ def generate_order_id():
 def generate_license_key(order_id, user_id):
     raw = "{}_{}_{}" .format(order_id, user_id, os.urandom(8).hex())
     h = hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
-    return "ZAKAT-{}-{}-{}-{}".format(h[:4], h[4:8], h[8:12], h[12:16])
+    return "PMT-{}-{}-{}-{}".format(h[:4], h[4:8], h[8:12], h[12:16])
 
 
 def is_admin(user_id):
@@ -284,7 +287,7 @@ def find_product_by_id(product_id):
 def create_payment_link(amount, order_id, product_name):
     comment = "\u0417\u0430\u043a\u0430\u0437 {}: {}".format(order_id, product_name)
     safe_targets = quote(comment, safe='')
-    success_url = quote('https://t.me/zakat_bot?start=success', safe='')
+    success_url = quote('https://t.me/pmt_bot?start=success', safe='')
     return (
         "https://yoomoney.ru/quickpay/confirm.xml"
         "?receiver={}"
@@ -366,7 +369,7 @@ class CryptoBotService:
             "asset": "USDT", "amount": str(amount_usdt),
             "description": description[:256], "payload": order_id,
             "paid_btn_name": "callback",
-            "paid_btn_url": "https://t.me/zakat_bot?start=paid_{}".format(order_id)
+            "paid_btn_url": "https://t.me/pmt_bot?start=paid_{}".format(order_id)
         }
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -419,62 +422,6 @@ class OrderState(StatesGroup):
     choosing_platform = State()
     choosing_subscription = State()
     choosing_payment = State()
-
-
-# ========== ИНТЕГРАЦИЯ С АГРЕГАТОРОМ ==========
-async def send_to_aggregator(order, product, license_key, source):
-    """Отправка данных о платеже в агрегатор"""
-    if not Config.AGGREGATOR_BOT_TOKEN or not Config.AGGREGATOR_ADMIN_ID:
-        logger.warning("Aggregator not configured")
-        return
-    
-    try:
-        # Конвертация в рубли
-        amount = order.get('amount', product['price'])
-        currency = order.get('currency', '₽')
-        
-        if currency in ('₽', 'RUB'):
-            amount_rub = float(amount)
-        elif currency == 'USDT':
-            amount_rub = float(amount) * 95
-        elif currency == '⭐':
-            amount_rub = float(amount) * 1.5
-        elif currency == 'GOLD':
-            amount_rub = float(amount) * 0.3
-        elif currency == 'NFT':
-            amount_rub = float(amount) * 0.4
-        else:
-            amount_rub = float(amount)
-        
-        payment_data = {
-            "source_bot": "zakat_premium",
-            "user_id": order["user_id"],
-            "user_name": order["user_name"],
-            "product_name": "{} ({})".format(
-                product['name'], product['duration']
-            ),
-            "amount": amount,
-            "currency": currency,
-            "amount_rub": amount_rub,
-            "payment_method": order.get('payment_method', source),
-            "license_key": license_key,
-        }
-        
-        aggregator_bot = Bot(token=Config.AGGREGATOR_BOT_TOKEN)
-        
-        cmd_text = "/record_payment {}".format(
-            json.dumps(payment_data, ensure_ascii=False)
-        )
-        
-        await aggregator_bot.send_message(
-            Config.AGGREGATOR_ADMIN_ID,
-            cmd_text
-        )
-        await aggregator_bot.session.close()
-        
-        logger.info("✅ Payment sent to aggregator")
-    except Exception as e:
-        logger.error("❌ Aggregator send error: %s", e)
 
 
 # ========== КЛАВИАТУРЫ ==========
@@ -551,7 +498,7 @@ def support_keyboard():
 
 def download_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001f4e5 \u0421\u043a\u0430\u0447\u0430\u0442\u044c ZAKAT", url=Config.DOWNLOAD_URL)],
+        [InlineKeyboardButton(text="\U0001f4e5 \u0421\u043a\u0430\u0447\u0430\u0442\u044c PMT", url=Config.DOWNLOAD_URL)],
         [InlineKeyboardButton(text="\U0001f4ac \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430", url="https://t.me/{}".format(Config.SUPPORT_CHAT_USERNAME))],
         [InlineKeyboardButton(text="\U0001f504 \u041d\u043e\u0432\u0430\u044f \u043f\u043e\u043a\u0443\u043f\u043a\u0430", callback_data="restart")]
     ])
@@ -598,7 +545,7 @@ async def process_successful_payment(order_id, source="API"):
 
     success_text = (
         "\U0001f389 <b>\u041e\u043f\u043b\u0430\u0442\u0430 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0430!</b>\n\n"
-        "\u2728 \u0414\u043e\u0431\u0440\u043e \u043f\u043e\u0436\u0430\u043b\u043e\u0432\u0430\u0442\u044c \u0432 ZAKAT!\n\n"
+        "\u2728 \u0414\u043e\u0431\u0440\u043e \u043f\u043e\u0436\u0430\u043b\u043e\u0432\u0430\u0442\u044c \u0432 PMT!\n\n"
         "\U0001f4e6 <b>\u0412\u0430\u0448\u0430 \u043f\u043e\u043a\u0443\u043f\u043a\u0430:</b>\n"
         "{emoji} {name}\n"
         "\u23f1\ufe0f \u0421\u0440\u043e\u043a: {duration}\n"
@@ -636,10 +583,6 @@ async def process_successful_payment(order_id, source="API"):
             await bot.send_message(aid, admin_text)
         except Exception as e:
             logger.error("Error notifying admin %s: %s", aid, e)
-    
-    # ========== ОТПРАВКА В АГРЕГАТОР ==========
-    await send_to_aggregator(order, product, license_key, source)
-    
     return True
 
 
@@ -661,7 +604,7 @@ async def send_admin_notification(user, product, payment_method, price, order_id
 
 async def send_start_message(target, state):
     text = (
-        "\U0001f3af <b>ZAKAT \u2014 \u041f\u0440\u0435\u043c\u0438\u0443\u043c \u0447\u0438\u0442 \u0434\u043b\u044f Standoff 2</b>\n\n"
+        "\U0001f3af <b>PMT \u2014 \u041f\u0440\u0435\u043c\u0438\u0443\u043c \u0447\u0438\u0442 \u0434\u043b\u044f Standoff 2</b>\n\n"
         "\u2728 <b>\u0412\u043e\u0437\u043c\u043e\u0436\u043d\u043e\u0441\u0442\u0438:</b>\n"
         "\U0001f6e1\ufe0f \u041f\u0440\u043e\u0434\u0432\u0438\u043d\u0443\u0442\u0430\u044f \u0437\u0430\u0449\u0438\u0442\u0430 \u043e\u0442 \u0431\u0430\u043d\u043e\u0432\n"
         "\U0001f3af \u0423\u043c\u043d\u044b\u0439 AimBot \u0441 \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430\u043c\u0438\n"
@@ -714,12 +657,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 })
                 await bot.send_invoice(
                     chat_id=message.from_user.id,
-                    title="ZAKAT \u2014 {}".format(product['name']),
+                    title="PMT \u2014 {}".format(product['name']),
                     description="\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043d\u0430 {} \u0434\u043b\u044f {}".format(product['duration'], product['platform']),
                     payload="stars_{}".format(order_id),
                     provider_token="", currency="XTR",
                     prices=[LabeledPrice(label="XTR", amount=product['price_stars'])],
-                    start_parameter="zakat_payment"
+                    start_parameter="pmt_payment"
                 )
                 return
     await send_start_message(message, state)
@@ -735,7 +678,7 @@ async def buy_cheat(callback: types.CallbackQuery, state: FSMContext):
 async def about_cheat(callback: types.CallbackQuery):
     text = (
         "\U0001f4cb <b>\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u0430\u044f \u0438\u043d\u0444\u043e\u0440\u043c\u0430\u0446\u0438\u044f</b>\n\n"
-        "\U0001f3ae <b>\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435:</b> ZAKAT\n"
+        "\U0001f3ae <b>\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435:</b> PMT\n"
         "\U0001f525 <b>\u0421\u0442\u0430\u0442\u0443\u0441:</b> \u0410\u043a\u0442\u0438\u0432\u043d\u043e \u043e\u0431\u043d\u043e\u0432\u043b\u044f\u0435\u0442\u0441\u044f\n\n"
         "\U0001f6e0\ufe0f <b>\u0424\u0443\u043d\u043a\u0446\u0438\u043e\u043d\u0430\u043b:</b>\n"
         "\u2022 \U0001f3af \u0423\u043c\u043d\u044b\u0439 AimBot\n\u2022 \U0001f441\ufe0f WallHack\n"
@@ -757,10 +700,10 @@ async def process_platform(callback: types.CallbackQuery, state: FSMContext):
         return
     await state.update_data(platform=platform)
     info = {
-        "apk": ("\U0001f4f1 <b>ZAKAT Android</b>",
+        "apk": ("\U0001f4f1 <b>PMT Android</b>",
                 "\u2022 Android 10.0+\n\u2022 2 \u0413\u0411 \u043f\u0430\u043c\u044f\u0442\u0438\n\u2022 Root \u043d\u0435 \u043d\u0443\u0436\u0435\u043d",
                 "\u2022 APK \u0444\u0430\u0439\u043b\n\u2022 \u0418\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u044f\n\u2022 \u041f\u043e\u0434\u0434\u0435\u0440\u0436\u043a\u0430"),
-        "ios": ("\U0001f34e <b>ZAKAT iOS</b>",
+        "ios": ("\U0001f34e <b>PMT iOS</b>",
                 "\u2022 iOS 14.0 - 18.0\n\u2022 AltStore\n\u2022 Jailbreak \u043d\u0435 \u043d\u0443\u0436\u0435\u043d",
                 "\u2022 IPA \u0444\u0430\u0439\u043b\n\u2022 \u0418\u043d\u0441\u0442\u0440\u0443\u043a\u0446\u0438\u044f\n\u2022 \u041f\u043e\u043c\u043e\u0449\u044c")
     }
@@ -898,12 +841,12 @@ async def process_stars_payment(callback: types.CallbackQuery):
     })
     await bot.send_invoice(
         chat_id=callback.from_user.id,
-        title="ZAKAT \u2014 {}".format(product['name']),
+        title="PMT \u2014 {}".format(product['name']),
         description="\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043d\u0430 {} \u0434\u043b\u044f {}".format(product['duration'], product['platform']),
         payload="stars_{}".format(order_id),
         provider_token="", currency="XTR",
         prices=[LabeledPrice(label="XTR", amount=product['price_stars'])],
-        start_parameter="zakat_payment"
+        start_parameter="pmt_payment"
     )
     await send_admin_notification(callback.from_user, product, "\u2b50 Stars", "{} \u2b50".format(product['price_stars']), order_id)
     try:
@@ -942,7 +885,7 @@ async def process_crypto_payment(callback: types.CallbackQuery):
         return
     order_id = generate_order_id()
     amount_usdt = product["price_crypto_usdt"]
-    invoice_data = await CryptoBotService.create_invoice(amount_usdt, order_id, "ZAKAT {} ({})".format(product['name'], product['duration']))
+    invoice_data = await CryptoBotService.create_invoice(amount_usdt, order_id, "PMT {} ({})".format(product['name'], product['duration']))
     if not invoice_data:
         await callback.answer("\u274c \u041e\u0448\u0438\u0431\u043a\u0430 \u0438\u043d\u0432\u043e\u0439\u0441\u0430", show_alert=True)
         return
@@ -1015,7 +958,7 @@ async def _process_manual_payment(callback, method):
     }[method]
     price = product[cfg["price_key"]]
     chat_message = (
-        "\u041f\u0440\u0438\u0432\u0435\u0442! \u0425\u043e\u0447\u0443 \u043a\u0443\u043f\u0438\u0442\u044c \u0447\u0438\u0442 ZAKAT \u043d\u0430 Standoff 2. "
+        "\u041f\u0440\u0438\u0432\u0435\u0442! \u0425\u043e\u0447\u0443 \u043a\u0443\u043f\u0438\u0442\u044c \u0447\u0438\u0442 PMT \u043d\u0430 Standoff 2. "
         "\u041f\u043e\u0434\u043f\u0438\u0441\u043a\u0430 \u043d\u0430 {period} ({platform}). "
         "\u0413\u043e\u0442\u043e\u0432 \u043a\u0443\u043f\u0438\u0442\u044c \u0437\u0430 {price} {method}"
     ).format(period=product['period_text'], platform=product['platform'], price=price, method=cfg['name'])
@@ -1128,8 +1071,8 @@ async def back_to_start(callback: types.CallbackQuery, state: FSMContext):
 async def back_to_subscription(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     platform = data.get("platform", "apk")
-    titles = {"apk": "\U0001f4f1 <b>ZAKAT Android</b>", "ios": "\U0001f34e <b>ZAKAT iOS</b>"}
-    text = "{}\n\n\U0001f4b0 <b>\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0442\u0430\u0440\u0438\u0444:</b>".format(titles.get(platform, "ZAKAT"))
+    titles = {"apk": "\U0001f4f1 <b>PMT Android</b>", "ios": "\U0001f34e <b>PMT iOS</b>"}
+    text = "{}\n\n\U0001f4b0 <b>\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0442\u0430\u0440\u0438\u0444:</b>".format(titles.get(platform, "PMT"))
     await callback.message.edit_text(text, reply_markup=subscription_keyboard(platform))
     await state.set_state(OrderState.choosing_subscription)
     await callback.answer()
@@ -1138,15 +1081,11 @@ async def back_to_subscription(callback: types.CallbackQuery, state: FSMContext)
 # ========== ЗАПУСК ==========
 async def main():
     logger.info("=" * 50)
-    logger.info("ZAKAT PREMIUM CHEAT SHOP BOT")
+    logger.info("PMT PREMIUM CHEAT SHOP BOT")
     logger.info("=" * 50)
     logger.info("ADMIN_IDS: %s", Config.ADMIN_IDS)
     logger.info("SUPPORT: @%s", Config.SUPPORT_CHAT_USERNAME)
     logger.info("DOWNLOAD: %s", Config.DOWNLOAD_URL)
-    if Config.AGGREGATOR_BOT_TOKEN and Config.AGGREGATOR_ADMIN_ID:
-        logger.info("✅ Aggregator: ENABLED")
-    else:
-        logger.warning("⚠️ Aggregator: DISABLED (not configured)")
 
     try:
         me = await bot.get_me()
